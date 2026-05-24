@@ -17,10 +17,12 @@ class Base(DeclarativeBase):
     pass
 
 # =====================================================================
-# TASK ASSIGNMENT: TEAMMATE A (Weak Teammate)
-# TODO: Create SQLALchemy models inheriting from Base for:
+# TASK ASSIGNMENT: Goli Manohar
+# TODO: Create SQLite-compatible SQLAlchemy models inheriting from Base for:
 # - SessionState (storing sessionId, archetype, current document draft)
 # - AuditLogs (storing historic Critic scorecard revisions)
+# (Note: Use SQLite types. PostgreSQL migrations will be handled 
+#  externally by the Team Lead.)
 # =====================================================================
 
 
