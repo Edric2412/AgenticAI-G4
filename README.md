@@ -30,7 +30,7 @@ graph TD
 
     %% Nodes
     A[Conception Hub: Raw Intake]:::init
-    B[pgvector Stylesheet Lookup]:::check
+    B[pgvector Semantic Style Guide Retrieval]:::check
     C["Writer Node (gemini-3.1-flash-lite)"]:::agent
     D["Critic Node (Llama 3.3 70B via Groq)"]:::agent
     E{Router Decision Edge}:::check
@@ -70,6 +70,15 @@ graph TD
 > **Circuit Breaker Loop Guard**  
 > To contain API token budgets and prevent infinite semantic loops (e.g. Writer and Critic disputing constraints endlessly), execution is automatically interrupted and routed to the user's dashboard after 3 revision cycles.
 
+> [!IMPORTANT]
+> **pgvector Semantic Retrieval**  
+> Style-guide embeddings are stored using PostgreSQL + pgvector `Vector(768)` columns, enabling high-performance cosine similarity retrieval for contextual drafting and reviewer alignment.
+
+> [!TIP]
+> **Groq Critic Orchestration**  
+> The Critic Node uses Groq-hosted Llama 3.3 70B to generate deterministic structured JSON scorecards for multi-agent document critique and revision routing.
+
+
 ---
 
 ## 📂 Monorepo Structure
@@ -86,14 +95,18 @@ DocuFlow/
 │   └── .env.example         # Template for client environment variables
 │
 ├── backend/                 # FastAPI Gateway + LangGraph API
+│   ├── alembic/             # Database migrations for PostgreSQL + pgvector
+│   ├── alembic.ini          # Alembic migration configuration
+│   ├── docker-compose.yml   # PostgreSQL pgvector infrastructure
 │   ├── app/
 │   │   ├── config.py        # Settings and environment API key validations
 │   │   ├── db.py            # SQLAlchemy database setup & pgvector lookup stubs
-│   │   ├── graph.py         # LangGraph workflow compilation & Node definitions
+│   │   ├── graph.py         # LangGraph workflow, Groq critic orchestration & routing logic
 │   │   ├── main.py          # FastAPI REST endpoints & Server-Sent Events stream
 │   │   ├── schemas.py       # Pydantic schema declarations
 │   │   └── state.py         # TypedDict graph state tracking definitions
-│   └── requirements.txt     # Python backend dependencies
+│   ├── requirements.txt     # Python backend dependencies
+│   └── .env.example         # Backend environment configuration template
 │
 └── .gitignore               # Unified monorepo git exclusions
 ```
@@ -121,6 +134,14 @@ DocuFlow/
 
 ### 2. Backend Setup (FastAPI)
 
+> [!IMPORTANT] 
+> **Docker Desktop Required**  
+> Docker Desktop is required for local pgvector PostgreSQL infrastructure.  
+> The semantic retrieval pipeline depends on PostgreSQL vector extension support and cannot run on SQLite.
+
+> [!NOTE]
+> New infrastructure dependencies include `pgvector`, `asyncpg`, `alembic`, and Groq/OpenAI-compatible client integrations for semantic retrieval and structured AI critique orchestration.
+
 1.  **Navigate to the backend directory**:
     ```bash
     cd backend
@@ -128,11 +149,136 @@ DocuFlow/
 2.  **Create and activate a virtual environment**:
     ```bash
     python -m venv .venv
+    ```
+
+    **Linux/macOS**
+    ```bash
     source .venv/bin/activate
     ```
-3.  **Install dependencies and run**:
+
+    **Windows**
+    ```bash
+    .venv\Scripts\activate
+    ```
+3.  **Install dependencies**:
     ```bash
     pip install -r requirements.txt
+    ```
+4.  **Create a `.env` file inside `backend/`**:
+
+> [!TIP]
+> Copy `.env.example` → `.env` before running the backend locally.
+
+```env
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5434/docuflow
+GEMINI_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
+```
+
+### 3. PostgreSQL + pgvector Setup
+
+1. **Start PostgreSQL with pgvector**
+
+```bash
+docker-compose up -d
+```
+
+2. **Verify container is running**
+
+```bash
+docker ps
+```
+
+Expected container:
+
+```text
+docuflow-postgres
+```
+
+3. **Enable pgvector extension**
+
+```bash
+docker exec -it docuflow-postgres psql -U postgres -d docuflow
+```
+
+Inside PostgreSQL shell:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+Exit PostgreSQL:
+
+```sql
+\q
+```
+
+4. **Run Alembic migrations**
+
+```bash
+python -m alembic upgrade head
+```
+
+> [!WARNING]
+> Backend startup may fail if migrations are not executed before running the FastAPI server.
+
+5.  **Start FastAPI backend**:
+    ```bash
     uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
     ```
-    *   Interactive Swagger API docs are available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+
+*   Interactive Swagger API docs are available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+   
+---
+
+## Infrastructure Verification Checklist
+
+### Verify Docker Container
+
+```bash
+docker ps
+```
+
+Expected:
+```text
+docuflow-postgres
+```
+
+### Verify pgvector Extension
+
+```bash
+docker exec -it docuflow-postgres psql -U postgres -d docuflow
+```
+
+Inside PostgreSQL:
+```sql
+SELECT extname FROM pg_extension;
+```
+
+Expected extension:
+```text
+vector
+```
+
+### Verify Alembic Migration
+
+```bash
+python -m alembic upgrade head
+```
+
+### Verify FastAPI Startup
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Expected:
+```text
+Application startup complete
+```
+
+### Verify Swagger Docs
+
+Open:
+```text
+http://127.0.0.1:8000/docs
