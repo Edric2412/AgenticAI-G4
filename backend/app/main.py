@@ -189,10 +189,23 @@ async def stream_document_updates(sessionId: str):
           
       current_state = state_info.values
       
-      # Yield current baseline state first
+      # Synchronize interrupted graph state before first stream emission
+      if current_state.get("status") == "running":
+
+            await app_graph.aupdate_state(
+                config,
+                {
+                    "status": "paused",
+                    "trace": current_state["trace"]
+                }
+            )
+
+            current_state["status"] = "paused"
+
+      # Yield synchronized baseline state
       yield {
           "event": "message",
-          "data": json.dumps(current_state)
+          "data": json.dumps(current_state, default=str)
       }
       
       # If status is running, we simulate token generation and state transition deltas.
@@ -218,9 +231,11 @@ async def stream_document_updates(sessionId: str):
           updated_state = await app_graph.aget_state(config)
 
           if updated_state and updated_state.values:
-                yield {
-                    "event": "message",
-                    "data": json.dumps(updated_state.values, default=str)
-                }
+              state_values = updated_state.values
 
+              yield {
+                  "event": "message",
+                  "data": json.dumps(state_values, default=str)
+              }
+            
     return EventSourceResponse(sse_generator())

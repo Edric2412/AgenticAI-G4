@@ -139,7 +139,7 @@ async def retrieve_context(query: str, archetype: str) -> str:
                 WHERE archetype = :archetype
                 ORDER BY
                     (
-                        embedding <=> :embedding
+                        embedding <=> CAST(:embedding AS vector)
                     ) +
                     (
                         1 - ts_rank(
