@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from app.config import settings
 import google.generativeai as genai
-from sqlalchemy import String, Text, select
+from sqlalchemy import String, Text, select, text
 from pgvector.sqlalchemy import Vector
 
 
@@ -112,11 +112,12 @@ async def index_style_guide(content: str, archetype: str):
 
 async def retrieve_context(query: str, archetype: str) -> str:
     """
-    Hybrid semantic retrieval using pgvector cosine similarity.
+    Hybrid semantic + lexical retrieval using pgvector + PostgreSQL full-text search.
     """
+
     if AsyncSessionLocal is None:
         raise RuntimeError("Database session is not initialized.")
-    
+
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
 
@@ -125,32 +126,48 @@ async def retrieve_context(query: str, archetype: str) -> str:
 
     archetype = archetype.strip().lower()
     query = query.strip()
-    
+
     embedding = await generate_embedding(query)
 
     async with AsyncSessionLocal() as session:
 
         try:
 
-            stmt = (
-                select(StyleGuideEmbedding.content)
-                .where(StyleGuideEmbedding.archetype == archetype)
-                .order_by(
-                    StyleGuideEmbedding.embedding.cosine_distance(embedding)
-                )
-                .limit(5)
+            sql = text("""
+                SELECT content
+                FROM style_guide_embeddings
+                WHERE archetype = :archetype
+                ORDER BY
+                    (
+                        embedding <=> :embedding
+                    ) +
+                    (
+                        1 - ts_rank(
+                            to_tsvector('english', content),
+                            plainto_tsquery('english', :query)
+                        )
+                    )
+                ASC
+                LIMIT 5
+            """)
+
+            result = await session.execute(
+                sql,
+                {
+                    "archetype": archetype,
+                    "embedding": embedding,
+                    "query": query
+                }
             )
 
-            result = await session.execute(stmt)
-
-            rows = result.scalars().all()
+            rows = result.fetchall()
 
         except Exception as e:
             raise RuntimeError(
-                f"Semantic retrieval failed: {str(e)}"
+                f"Hybrid retrieval failed: {str(e)}"
             )
 
     if not rows:
         return "No style guide context found."
 
-    return "\n\n".join(rows)
+    return "\n\n".join([row[0] for row in rows])

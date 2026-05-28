@@ -97,18 +97,32 @@ async def critic_node(state: DocumentState) -> DocumentState:
     Return STRICT JSON ONLY.
 
     Required JSON Schema:
+{{
+  "score": integer,
+  "checks": [
     {{
-    "score": integer,
-    "checks": [
-        {{
-        "id": "sec",
-        "name": "Security Layer",
-        "status": "verified"
-        }}
-    ],
-    "summary": "short critique summary"
+      "id": "sec",
+      "name": "Security Layer",
+      "status": "verified"
+    }},
+    {{
+      "id": "sov",
+      "name": "Data Sovereignty",
+      "status": "verified"
+    }},
+    {{
+      "id": "tok",
+      "name": "Token Handling",
+      "status": "verified"
+    }},
+    {{
+      "id": "rat",
+      "name": "Rate Limiting",
+      "status": "verified"
     }}
-
+  ],
+  "summary": "short critique summary"
+}}
     Document:
     {document}
     """
