@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     
-    # Database configurations (SQLite async local fallback)
-    DATABASE_URL: str = "sqlite+aiosqlite:///./docuflow.db"
+    # Database configurations
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost:5432/docuflow"
     
     # Model API Keys (optional for skeletal fallback operations)
     GEMINI_API_KEY: Optional[str] = None

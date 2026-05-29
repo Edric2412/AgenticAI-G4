@@ -189,10 +189,23 @@ async def stream_document_updates(sessionId: str):
           
       current_state = state_info.values
       
-      # Yield current baseline state first
+      # Synchronize interrupted graph state before first stream emission
+      if current_state.get("status") == "running":
+
+            await app_graph.aupdate_state(
+                config,
+                {
+                    "status": "paused",
+                    "trace": current_state["trace"]
+                }
+            )
+
+            current_state["status"] = "paused"
+
+      # Yield synchronized baseline state
       yield {
           "event": "message",
-          "data": json.dumps(current_state)
+          "data": json.dumps(current_state, default=str)
       }
       
       # If status is running, we simulate token generation and state transition deltas.
@@ -214,46 +227,15 @@ async def stream_document_updates(sessionId: str):
                   "data": json.dumps(current_state)
               }
           
-          # Transition scorecard Critic checks
-          await asyncio.sleep(1.0)
-          
-          loop = current_state.get("loopCount", 0)
-          if loop == 0:
-              current_state["scorecard"] = Scorecard(
-                  score=88,
-                  checks=[
-                      AuditCheck(id="sec", name="Security Layer", status="verified"),
-                      AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
-                      AuditCheck(id="tok", name="Token Handling", status="attention"),
-                      AuditCheck(id="rat", name="Rate Limiting", status="pending"),
-                  ],
-                  summary="Critic flagged missing Rate Limiting specs and ambiguous Token Handling protocols."
-              )
-          else:
-              current_state["scorecard"] = Scorecard(
-                  score=98,
-                  checks=[
-                      AuditCheck(id="sec", name="Security Layer", status="verified"),
-                      AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
-                      AuditCheck(id="tok", name="Token Handling", status="verified"),
-                      AuditCheck(id="rat", name="Rate Limiting", status="verified"),
-                  ],
-                  summary="Critic check verified. Rate Limiting and Token Handling meet design requirements."
-              )
-              
-          current_state["status"] = "paused"
-          current_state["trace"][3]["status"] = "completed"
-          
-          # Write updated values to state checkpoint so GET calls return matched status
-          await app_graph.aupdate_state(config, {
-              "scorecard": current_state["scorecard"],
-              "status": "paused",
-              "trace": current_state["trace"]
-          })
-          
-          yield {
-              "event": "message",
-              "data": json.dumps(current_state)
-          }
+          # Fetch latest persisted graph state
+          updated_state = await app_graph.aget_state(config)
 
+          if updated_state and updated_state.values:
+              state_values = updated_state.values
+
+              yield {
+                  "event": "message",
+                  "data": json.dumps(state_values, default=str)
+              }
+            
     return EventSourceResponse(sse_generator())

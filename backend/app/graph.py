@@ -1,9 +1,18 @@
+import json
+from openai import AsyncOpenAI
+from app.config import settings
+
 from typing import Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.state import DocumentState
-from app.schemas import Scorecard, AuditCheck, TraceStep
+from app.schemas import Scorecard, TraceStep
+
+groq_client = AsyncOpenAI(
+    api_key=settings.GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
 
 # =====================================================================
 # TASK ASSIGNMENT: TEAMMATE B (Intermediate/Strong Teammate)
@@ -69,32 +78,91 @@ async def critic_node(state: DocumentState) -> DocumentState:
     - Request JSON matching schemas.Scorecard schema.
     - Check compliance metrics, code styles, and data safety bounds.
     """
-    loop_count = state.get("loopCount", 0)
     
-    # Simulated scorecard output
-    if loop_count == 0:
-        scorecard = Scorecard(
-            score=88,
-            checks=[
-                AuditCheck(id="sec", name="Security Layer", status="verified"),
-                AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
-                AuditCheck(id="tok", name="Token Handling", status="attention"),
-                AuditCheck(id="rat", name="Rate Limiting", status="pending")
+    document = state.get("documentContent", "")
+
+    prompt = f"""
+    You are a senior enterprise compliance reviewer.
+
+    Review the following professional document.
+
+    Evaluate:
+    1. Security Layer
+    2. Data Sovereignty
+    3. Token Handling
+    4. Rate Limiting
+    5. Structural Completeness
+    6. Compliance Quality
+
+    Return STRICT JSON ONLY.
+
+    Required JSON Schema:
+{{
+  "score": integer,
+  "checks": [
+    {{
+      "id": "sec",
+      "name": "Security Layer",
+      "status": "verified"
+    }},
+    {{
+      "id": "sov",
+      "name": "Data Sovereignty",
+      "status": "verified"
+    }},
+    {{
+      "id": "tok",
+      "name": "Token Handling",
+      "status": "verified"
+    }},
+    {{
+      "id": "rat",
+      "name": "Rate Limiting",
+      "status": "verified"
+    }}
+  ],
+  "summary": "short critique summary"
+}}
+    Document:
+    {document}
+    """
+
+    try:
+
+        response = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
-            summary="Critic flagged missing Rate Limiting specs and ambiguous Token Handling protocols."
-        )
-    else:
-        scorecard = Scorecard(
-            score=98,
-            checks=[
-                AuditCheck(id="sec", name="Security Layer", status="verified"),
-                AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
-                AuditCheck(id="tok", name="Token Handling", status="verified"),
-                AuditCheck(id="rat", name="Rate Limiting", status="verified")
-            ],
-            summary="Critic check verified. Rate Limiting and Token Handling meet design requirements."
+
+            temperature=0.2,
+
+            response_format={
+                "type": "json_object"
+            }
         )
 
+        content = response.choices[0].message.content
+
+        cleaned = content.strip()
+
+        if cleaned.startswith("```json"):
+            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+        parsed = json.loads(cleaned)
+
+        scorecard = Scorecard(**parsed)
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Groq critique generation failed: {str(e)}"
+        )
+    
     trace = list(state.get("trace", []))
     trace[3] = TraceStep(id="4", name="Validation Check", description="Audit checks completed.", status="completed")
     
@@ -124,7 +192,7 @@ async def deployment_node(state: DocumentState) -> DocumentState:
 
 # Router logic
 def route_evaluation(state: DocumentState) -> Literal["writer_node", "human_arbitration_node", "deployment_node"]:
-    score = state["scorecard"]["score"]
+    score = state["scorecard"].score
     loop_count = state.get("loopCount", 0)
     max_loops = state.get("maxLoops", 3)
     
