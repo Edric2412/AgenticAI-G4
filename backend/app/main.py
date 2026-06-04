@@ -11,7 +11,7 @@ from app.schemas import (
     DocumentSessionResponse,
     Scorecard,
     AuditCheck,
-    TraceStep
+    TraceStep,
 )
 from app.graph import app_graph
 from app.state import DocumentState
@@ -28,11 +28,12 @@ app.add_middleware(
 
 session_configs = {}
 
-# ── Helper: serialize Pydantic objects to JSON ────────────────────────
+
 def to_json(obj) -> str:
+    """Serialize state dict — converts Pydantic objects via model_dump()."""
     return json.dumps(
         obj,
-        default=lambda o: o.model_dump() if hasattr(o, "model_dump") else str(o)
+        default=lambda o: o.model_dump() if hasattr(o, "model_dump") else str(o),
     )
 
 
@@ -43,7 +44,7 @@ async def create_document(request: CreateDocumentRequest):
     session_configs[session_id] = {
         "maxLoops": request.loopGuard,
         "archetype": request.archetype,
-        "payloadText": request.payloadText
+        "payloadText": request.payloadText,
     }
 
     initial_state: DocumentState = {
@@ -61,28 +62,31 @@ async def create_document(request: CreateDocumentRequest):
                 AuditCheck(id="tok", name="Token Handling",   status="pending"),
                 AuditCheck(id="rat", name="Rate Limiting",    status="pending"),
             ],
-            summary="Awaiting analysis initialization."
+            summary="Awaiting analysis initialization.",
         ),
         "trace": [
-            TraceStep(id="1", name="Context Analysis",    description="Analyzing inputs...",             status="pending"),
-            TraceStep(id="2", name="Architecture Mapping",description="Mapping nodes...",                status="pending"),
-            TraceStep(id="3", name="PRD Synthesis",       description="Preparing drafting compiler...", status="pending"),
-            TraceStep(id="4", name="Validation Check",    description="Awaiting draft...",              status="pending"),
+            TraceStep(id="1", name="Context Analysis",     description="Analyzing inputs...",             status="pending"),
+            TraceStep(id="2", name="Architecture Mapping", description="Mapping nodes...",                status="pending"),
+            TraceStep(id="3", name="PRD Synthesis",        description="Preparing drafting compiler...", status="pending"),
+            TraceStep(id="4", name="Validation Check",     description="Awaiting draft...",              status="pending"),
         ],
         "payloadText": request.payloadText,
         "feedback": None,
-        "current_step": "init"
+        "current_step": "init",
     }
 
     config = {"configurable": {"thread_id": session_id}}
     await app_graph.ainvoke(initial_state, config=config)
 
-    # LangGraph stops BEFORE human_arbitration_node due to interrupt_before.
-    # That node never runs, so status stays "running" in the checkpoint.
-    # We manually set it to "paused" so the frontend knows to stop and
-    # enable the Approve & Request Revision buttons.
+    # LangGraph pauses BEFORE human_arbitration_node (interrupt_before).
+    # That node never runs on first pass, so status stays "running".
+    # We manually set it to "paused" so the frontend enables the action buttons.
     state_info = await app_graph.aget_state(config)
-    if state_info and state_info.next and "human_arbitration_node" in state_info.next:
+    if (
+        state_info
+        and state_info.next
+        and "human_arbitration_node" in state_info.next
+    ):
         await app_graph.aupdate_state(config, {"status": "paused"})
 
     return {"sessionId": session_id}
@@ -90,6 +94,7 @@ async def create_document(request: CreateDocumentRequest):
 
 @app.api_route("/api/documents/{sessionId}", methods=["GET", "HEAD"])
 async def get_document_state(sessionId: str, request: Request):
+    # HEAD used by frontend to check if backend is alive
     if request.method == "HEAD":
         return Response(status_code=200)
 
@@ -112,17 +117,26 @@ async def submit_revision_feedback(sessionId: str, request: FeedbackRequest):
 
     current_loops = state_info.values.get("loopCount", 0)
 
-    await app_graph.aupdate_state(config, {
-        "feedback": request.feedback,
-        "loopCount": current_loops + 1,
-        "status": "running"
-    })
+    await app_graph.aupdate_state(
+        config,
+        {
+            "feedback": request.feedback,
+            "loopCount": current_loops + 1,
+            "status": "running",
+        },
+    )
 
+    # Resume graph — runs human_arbitration_node, then route_after_arbitration
+    # routes to writer_node because feedback is set
     await app_graph.ainvoke(None, config=config)
 
-    # Same interrupt fix — set paused if graph stopped at HITL node
+    # After revision, graph pauses again at interrupt_before — set paused
     state_info = await app_graph.aget_state(config)
-    if state_info and state_info.next and "human_arbitration_node" in state_info.next:
+    if (
+        state_info
+        and state_info.next
+        and "human_arbitration_node" in state_info.next
+    ):
         await app_graph.aupdate_state(config, {"status": "paused"})
 
     return {"status": "resumed"}
@@ -136,67 +150,69 @@ async def approve_document(sessionId: str):
     if not state_info or not state_info.values:
         raise HTTPException(status_code=404, detail="Session thread not found.")
 
-    await app_graph.aupdate_state(config, {
-        "feedback": None,
-        "scorecard": Scorecard(
-            score=100,
-            checks=[
-                AuditCheck(id="sec", name="Security Layer",   status="verified"),
-                AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
-                AuditCheck(id="tok", name="Token Handling",   status="verified"),
-                AuditCheck(id="rat", name="Rate Limiting",    status="verified"),
-            ],
-            summary="Approved by human reviewer."
-        ),
-        "status": "completed"
-    })
+    # Force score to 100 — route_after_arbitration will send to deployment_node
+    await app_graph.aupdate_state(
+        config,
+        {
+            "feedback": None,
+            "scorecard": Scorecard(
+                score=100,
+                checks=[
+                    AuditCheck(id="sec", name="Security Layer",   status="verified"),
+                    AuditCheck(id="sov", name="Data Sovereignty", status="verified"),
+                    AuditCheck(id="tok", name="Token Handling",   status="verified"),
+                    AuditCheck(id="rat", name="Rate Limiting",    status="verified"),
+                ],
+                summary="Approved by human reviewer.",
+            ),
+            "status": "running",
+        },
+    )
 
+    # Resume graph — human_arbitration_node runs, then routes to deployment_node
     await app_graph.ainvoke(None, config=config)
+
     return {"status": "approved"}
 
 
 @app.get("/api/documents/{sessionId}/stream")
 async def stream_document_updates(sessionId: str):
     """
-    SSE endpoint — streams the real LangGraph checkpoint state to the frontend.
-    Polls until status is 'paused' or 'completed', then stops.
-    No simulation. No fake data. Just the real checkpoint.
+    SSE endpoint — streams real LangGraph checkpoint state to the frontend.
+    Polls until status is 'paused' or 'completed', then closes.
     """
     async def sse_generator():
         config = {"configurable": {"thread_id": sessionId}}
 
         yield {
             "event": "connection",
-            "data": json.dumps({"status": "connected", "sessionId": sessionId})
+            "data": json.dumps({"status": "connected", "sessionId": sessionId}),
         }
 
-        last_state_values = None
-
-        for _ in range(90):  # poll up to 90 seconds
+        for _ in range(90):  # poll for up to 90 seconds
             state_info = await app_graph.aget_state(config)
 
             if not state_info or not state_info.values:
                 yield {
                     "event": "error",
-                    "data": json.dumps({"error": "Session state unavailable"})
+                    "data": json.dumps({"error": "Session state unavailable"}),
                 }
                 return
 
-            last_state_values = state_info.values
-            current_status = last_state_values.get("status")
+            current_status = state_info.values.get("status")
 
-            # If graph is paused at interrupt point, status may still say "running"
-            # Fix it: check if next node is human_arbitration_node
-            if (current_status == "running"
-                    and state_info.next
-                    and "human_arbitration_node" in state_info.next):
+            # Safety net: if still running but graph is at interrupt point, fix status
+            if (
+                current_status == "running"
+                and state_info.next
+                and "human_arbitration_node" in state_info.next
+            ):
                 await app_graph.aupdate_state(config, {"status": "paused"})
-                last_state_values = {**last_state_values, "status": "paused"}
                 current_status = "paused"
 
             yield {
                 "event": "message",
-                "data": to_json(last_state_values)
+                "data": to_json(state_info.values),
             }
 
             if current_status in ("paused", "completed"):
