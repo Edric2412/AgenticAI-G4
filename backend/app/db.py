@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from app.config import settings
 import google.generativeai as genai
-from sqlalchemy import String, Text, select, text
+from sqlalchemy import String, Text, select, text, Integer, JSON
 from pgvector.sqlalchemy import Vector
 
 
@@ -32,12 +32,31 @@ class StyleGuideEmbedding(Base):
 
 # =====================================================================
 # TASK ASSIGNMENT: Goli Manohar
-# TODO: Create SQLite-compatible SQLAlchemy models inheriting from Base for:
-# - SessionState (storing sessionId, archetype, current document draft)
-# - AuditLogs (storing historic Critic scorecard revisions)
-# (Note: Use SQLite types. PostgreSQL migrations will be handled 
-#  externally by the Team Lead.)
+# SQLite-compatible SQLAlchemy models inheriting from Base:
 # =====================================================================
+
+class SessionState(Base):
+    __tablename__ = "session_states"
+
+    session_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    archetype: Mapped[str] = mapped_column(String(50), nullable=False)
+    document_content: Mapped[str] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="idle")
+    loop_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_loops: Mapped[int] = mapped_column(Integer, default=3)
+    payload_text: Mapped[str] = mapped_column(Text, nullable=True)
+    feedback: Mapped[str] = mapped_column(Text, nullable=True)
+    current_step: Mapped[str] = mapped_column(String(100), nullable=True)
+    scorecard: Mapped[dict] = mapped_column(JSON, nullable=True)
+    trace: Mapped[list] = mapped_column(JSON, nullable=True)
+
+class AuditLogs(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    loop_count: Mapped[int] = mapped_column(Integer, default=0)
+    scorecard: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 # =====================================================================
@@ -55,8 +74,9 @@ async def generate_embedding(text: str) -> List[float]:
 
     try:
         response = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text
+            model="models/gemini-embedding-2",
+            content=text,
+            output_dimensionality=768
         )
 
     except Exception as e:
