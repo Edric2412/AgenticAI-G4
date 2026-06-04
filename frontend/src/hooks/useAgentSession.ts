@@ -60,34 +60,32 @@ export function useAgentSession(sessionId: string) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSimulated, setIsSimulated] = useState(false);
-  
-  const simulationRef = useRef<number | null>(null);
 
-  // Stop simulation on unmount
+  const simulationRef = useRef<number | null>(null);
+  // Ref to hold the active EventSource so we can close/reopen it
+  const eventSourceRef = useRef<EventSource | null>(null);
+
   useEffect(() => {
     return () => {
       if (simulationRef.current) clearInterval(simulationRef.current);
+      if (eventSourceRef.current) eventSourceRef.current.close();
     };
   }, []);
 
-  // Simulator helper function
   const runSimulation = useCallback((loop: number, feedback?: string) => {
     setIsGenerating(true);
     setIsSimulated(true);
 
     if (loop === 0) {
-      // Step 1: Context Analysis
       setSession((prev) => ({
         ...prev,
         status: "running",
-        trace: prev.trace.map((t, idx) => 
+        trace: prev.trace.map((t, idx) =>
           idx === 0 ? { ...t, status: "active" } : t
         ),
       }));
 
-      // Timeline of steps
       setTimeout(() => {
-        // Complete step 1, start step 2
         setSession((prev) => ({
           ...prev,
           trace: prev.trace.map((t, idx) => {
@@ -99,7 +97,6 @@ export function useAgentSession(sessionId: string) {
       }, 1500);
 
       setTimeout(() => {
-        // Complete step 2, start step 3 (PRD Synthesis)
         setSession((prev) => ({
           ...prev,
           trace: prev.trace.map((t, idx) => {
@@ -109,20 +106,15 @@ export function useAgentSession(sessionId: string) {
           }),
         }));
 
-        // Stream text
         let charIndex = 0;
         const text = MOCK_DOCUMENT_CONTENT_1;
-        const intervalTime = 15; // ms per chunk
-
         if (simulationRef.current) clearInterval(simulationRef.current);
-        
+
         const intervalId = window.setInterval(() => {
           charIndex += 4;
           if (charIndex >= text.length) {
             clearInterval(intervalId);
             setIsGenerating(false);
-            
-            // Start Step 4: Validation Check (Critic Node)
             setSession((prev) => ({
               ...prev,
               documentContent: text,
@@ -132,8 +124,6 @@ export function useAgentSession(sessionId: string) {
                 return t;
               }),
             }));
-
-            // Complete Critique validation
             setTimeout(() => {
               setSession((prev) => ({
                 ...prev,
@@ -148,7 +138,7 @@ export function useAgentSession(sessionId: string) {
                   ],
                   summary: "Critic flagged missing Rate Limiting specs and ambiguous Token Handling protocols.",
                 },
-                trace: prev.trace.map((t, idx) => 
+                trace: prev.trace.map((t, idx) =>
                   idx === 3 ? { ...t, status: "completed" } : t
                 ),
               }));
@@ -157,17 +147,16 @@ export function useAgentSession(sessionId: string) {
             setSession((prev) => ({
               ...prev,
               documentContent: text.substring(0, charIndex),
-              trace: prev.trace.map((t, idx) => 
+              trace: prev.trace.map((t, idx) =>
                 idx === 2 ? { ...t, progress: Math.min(99, Math.floor((charIndex / text.length) * 100)) } : t
               ),
             }));
           }
-        }, intervalTime);
-        
+        }, 15);
+
         simulationRef.current = intervalId;
       }, 3000);
     } else {
-      // Loop 1 (Revision request)
       setSession((prev) => ({
         ...prev,
         status: "running",
@@ -180,11 +169,8 @@ export function useAgentSession(sessionId: string) {
       }));
 
       setTimeout(() => {
-        // Stream the additional section
         let charIndex = MOCK_DOCUMENT_CONTENT_1.length;
         const text = MOCK_DOCUMENT_CONTENT_2;
-        const intervalTime = 15;
-
         if (simulationRef.current) clearInterval(simulationRef.current);
 
         const intervalId = window.setInterval(() => {
@@ -192,7 +178,6 @@ export function useAgentSession(sessionId: string) {
           if (charIndex >= text.length) {
             clearInterval(intervalId);
             setIsGenerating(false);
-
             setSession((prev) => ({
               ...prev,
               documentContent: text,
@@ -202,12 +187,10 @@ export function useAgentSession(sessionId: string) {
                 return t;
               }),
             }));
-
-            // Final Critic score check
             setTimeout(() => {
               setSession((prev) => ({
                 ...prev,
-                status: "paused", // Paused again for approval
+                status: "paused",
                 scorecard: {
                   score: 98,
                   checks: [
@@ -218,7 +201,7 @@ export function useAgentSession(sessionId: string) {
                   ],
                   summary: "Critic check verified. Rate Limiting and Token Handling meet design requirements.",
                 },
-                trace: prev.trace.map((t, idx) => 
+                trace: prev.trace.map((t, idx) =>
                   idx === 3 ? { ...t, status: "completed", description: "Audit checks successful." } : t
                 ),
               }));
@@ -229,65 +212,81 @@ export function useAgentSession(sessionId: string) {
               documentContent: text.substring(0, charIndex),
             }));
           }
-        }, intervalTime);
+        }, 15);
 
         simulationRef.current = intervalId;
       }, 1500);
     }
   }, []);
 
-  // Main execution logic: Connects to SSE or starts simulation
+  // ── Core SSE connection function ──────────────────────────────────────
+  // Extracted as useCallback so requestRevision and approve can re-call it
+  const connectToSSE = useCallback(() => {
+    // Close any existing connection first
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+
+    const eventSource = new EventSource(
+      `${API_BASE_URL}/api/documents/${sessionId}/stream`
+    );
+    eventSourceRef.current = eventSource;
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setSession(data);
+        setIsGenerating(data.status === "running");
+      } catch (err) {
+        console.error("SSE parse error", err);
+      }
+    };
+
+    eventSource.onerror = (err) => {
+      console.error("SSE error", err);
+      eventSource.close();
+      eventSourceRef.current = null;
+
+      // Only fall back to simulation if no real content was received
+      setSession((prev) => {
+        if (prev.documentContent && prev.documentContent.length > 50) {
+          // Real content exists — stream closed normally after paused/completed
+          setIsGenerating(false);
+          return prev;
+        }
+        // No real content — backend unavailable, run simulation
+        setError("SSE channel disconnected. Falling back to local offline simulation.");
+        runSimulation(0);
+        return prev;
+      });
+    };
+  }, [sessionId, runSimulation]);
+
+  // ── Initial connection on mount ───────────────────────────────────────
   useEffect(() => {
     if (!sessionId) return;
 
-    // Connect to actual SSE endpoint if available (check process.env or fallback)
-    const apiEndpoint = `${API_BASE_URL}/api/documents/${sessionId}/stream`;
-    
-    // We try to test if backend exists, else we fall back to simulation
     const testAndConnect = async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/api/documents/${sessionId}`, { method: "HEAD" });
+        const res = await fetch(`${API_BASE_URL}/api/documents/${sessionId}`, {
+          method: "HEAD",
+        });
         if (res.ok) {
-          // Backend is running, connect to SSE EventSource
-          const eventSource = new EventSource(apiEndpoint);
-          
-          eventSource.onmessage = (event) => {
-            try {
-              const data = JSON.parse(event.data);
-              setSession(data);
-              if (data.status === "running") {
-                setIsGenerating(true);
-              } else {
-                setIsGenerating(false);
-              }
-            } catch (err) {
-              console.error("SSE parse error", err);
-            }
-          };
-
-          eventSource.onerror = (err) => {
-            console.error("SSE error", err);
-            setError("SSE channel disconnected. Falling back to local offline simulation.");
-            eventSource.close();
-            // Start simulation as recovery
-            runSimulation(0);
-          };
-
-          return () => eventSource.close();
+          connectToSSE();
         } else {
-          // HTTP error, start mock simulation
           runSimulation(0);
         }
       } catch (e) {
-        // Fetch failed (network error / backend not running), start mock simulation
+        console.error("Backend unavailable, using simulation:", e);
         runSimulation(0);
       }
     };
 
     testAndConnect();
-  }, [sessionId, runSimulation]);
+  }, [sessionId, connectToSSE, runSimulation]);
 
-  // Request a revision
+  // ── Request Revision ──────────────────────────────────────────────────
   const requestRevision = useCallback(async (feedback: string) => {
     if (isSimulated) {
       runSimulation(session.loopCount + 1, feedback);
@@ -295,52 +294,59 @@ export function useAgentSession(sessionId: string) {
     }
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/documents/${sessionId}/feedback`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ feedback }),
-      });
+      setIsGenerating(true);
+      setSession((prev) => ({ ...prev, status: "running" }));
+
+      const res = await fetch(
+        `${API_BASE_URL}/api/documents/${sessionId}/feedback`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ feedback }),
+        }
+      );
       if (!res.ok) throw new Error("Feedback request failed.");
+
+      // ← KEY FIX: reconnect SSE to receive the revised document
+      connectToSSE();
     } catch (err) {
       console.error(err);
-      setError("Failed to send feedback to server. Simulating request instead.");
+      setError("Failed to send feedback. Simulating instead.");
       runSimulation(session.loopCount + 1, feedback);
     }
-  }, [sessionId, session.loopCount, isSimulated, runSimulation]);
+  }, [sessionId, session.loopCount, isSimulated, runSimulation, connectToSSE]);
 
-  // Approve & Deploy
+  // ── Approve & Deploy ──────────────────────────────────────────────────
   const approve = useCallback(async () => {
     setSession((prev) => ({ ...prev, status: "running" }));
     setIsGenerating(true);
 
     if (isSimulated) {
       setTimeout(() => {
-        setSession((prev) => ({
-          ...prev,
-          status: "completed",
-        }));
+        setSession((prev) => ({ ...prev, status: "completed" }));
         setIsGenerating(false);
       }, 2000);
       return;
     }
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/documents/${sessionId}/approve`, {
-        method: "POST",
-      });
-      if (!res.ok) throw new Error("Approval submission failed.");
+      const res = await fetch(
+        `${API_BASE_URL}/api/documents/${sessionId}/approve`,
+        { method: "POST" }
+      );
+      if (!res.ok) throw new Error("Approval failed.");
+
+      // ← KEY FIX: reconnect SSE to receive the completed status
+      connectToSSE();
     } catch (err) {
       console.error(err);
-      setError("Failed to approve document on server. Simulating approval completion.");
+      setError("Approval failed on server. Simulating completion.");
       setTimeout(() => {
-        setSession((prev) => ({
-          ...prev,
-          status: "completed",
-        }));
+        setSession((prev) => ({ ...prev, status: "completed" }));
         setIsGenerating(false);
       }, 2000);
     }
-  }, [sessionId, isSimulated]);
+  }, [sessionId, isSimulated, connectToSSE]);
 
   return {
     session,
