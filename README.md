@@ -78,6 +78,9 @@ graph TD
 > **Groq Critic Orchestration**  
 > The Critic Node uses Groq-hosted Llama 3.3 70B to generate deterministic structured JSON scorecards for multi-agent document critique and revision routing.
 
+> [!TIP]
+> **Semantic Enrichment & Conflict Detection Toggles**  
+> Conception Hub toggles dynamically control downstream model behaviors. *Semantic Enrichment* pulls style context dynamically via `pgvector` to enrich drafts, while *Conflict Detection* appends a dedicated internal contradiction evaluation check (ID: `con`) to the Critic's prompt and checklist.
 
 ---
 
@@ -282,3 +285,36 @@ Application startup complete
 Open:
 ```text
 http://127.0.0.1:8000/docs
+```
+
+---
+
+## 🧪 End-to-End Archetype Testing
+
+DocuFlow AI includes a robust Playwright E2E integration test suite that verifies the entire document generation, human revision loop, approval, and dashboard reporting flow. The test script has been parameterized to support testing any of the document archetypes.
+
+### Running Archetype E2E Tests
+
+Ensure both the Next.js frontend (port 3000) and the FastAPI backend (port 8000) are running, then run the test script specifying your desired archetype:
+
+```bash
+# Run tests using the backend virtual environment python
+./backend/venv/bin/python e2e_test.py --archetype [Technical | Legal | Financial | Creative]
+```
+
+* Archetype-specific screenshots (e.g. `1_conception_legal.png`, `4_canvas_paused_legal.png`, etc.) will be archived in the workspace scratch directory: `/home/edricjsam/.gemini/antigravity-ide/scratch/`.
+
+---
+
+## 🔒 Database & Connection Resilience
+
+The database connector incorporates production-grade resiliency controls to prevent transaction cancellations and pool contamination:
+
+1. **Atomic DB Writes (`asyncio.shield`)**:
+   Background session state persistence tasks are shielded from cancellation. If a client terminates their SSE stream connection or navigates away, the database write operation is guaranteed to finish atomically, preventing transaction truncation.
+
+2. **Optimistic Disconnect Handling (`pool_pre_ping`)**:
+   The SQLAlchemy engine uses `pool_pre_ping=True` and a connection recycle timeout of 30 minutes to verify connection health before checking them out of the pool. If a database session drops or gets disconnected, the pool automatically recycles the connection, eliminating `InterfaceError: connection is closed` exceptions.
+
+3. **Transaction Rollback Safeguards**:
+   The persistence layer explicitly catches `BaseException` (which captures `asyncio.CancelledError`) to execute a clean transaction rollback on cancellation before bubbling up, preventing session leaks.
