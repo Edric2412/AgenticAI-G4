@@ -15,6 +15,8 @@ class DocumentState(TypedDict):
     # Inputs & payload configurations
     payloadText: str
     feedback: Optional[str]
+    semanticEnrichment: Optional[bool]
+    conflictDetection: Optional[bool]
     
     # Internal helper state
     current_step: Optional[str]

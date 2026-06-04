@@ -4,6 +4,8 @@ import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Topbar from "@/components/Topbar";
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+
 type Archetype = "Technical" | "Legal" | "Financial" | "Creative";
 
 export default function ConceptionHub() {
@@ -15,18 +17,8 @@ export default function ConceptionHub() {
   const [semanticEnrichment, setSemanticEnrichment] = useState(true);
   const [conflictDetection, setConflictDetection] = useState(false);
   const [payloadText, setPayloadText] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
-  // Footer Telemetry State
-  const [tokenCount, setTokenCount] = useState(12482);
-  const [activeTab, setActiveTab] = useState<"Raw Input" | "Preview Schema" | "Metadata Tags">("Raw Input");
-
-  // Time-based simulated token increment
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTokenCount((prev) => prev + Math.floor(Math.random() * 5));
-    }, 3000);
-    return () => clearInterval(interval);
-  }, []);
 
   // Aurora blobs mouse follow effect
   useEffect(() => {
@@ -63,11 +55,39 @@ export default function ConceptionHub() {
 
   // Submission handler
   const handleStartPipeline = async () => {
-    // Generate a mock sessionId to simulate FastAPI LangGraph checkpoint instantiations
-    const mockSessionId = "dfl_" + Math.random().toString(36).substring(2, 11);
-    
-    // Redirect to Page 3 (Agentic Canvas)
-    router.push(`/canvas/${mockSessionId}`);
+    if (isSubmitting) return;
+    if (!payloadText.trim()) {
+      alert("Please enter a workspace payload.");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/documents`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          archetype,
+          payloadText,
+          loopGuard,
+          semanticEnrichment,
+          conflictDetection,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Failed to start pipeline: ${res.statusText}`);
+      }
+      const data = await res.json();
+      router.push(`/canvas/${data.sessionId}`);
+    } catch (err) {
+      console.error("Backend error starting pipeline, falling back to local simulation:", err);
+      // Fallback to simulation if backend is down or fails
+      const mockSessionId = "dfl_" + Math.random().toString(36).substring(2, 11);
+      router.push(`/canvas/${mockSessionId}`);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleClearWorkspace = () => {
@@ -251,9 +271,10 @@ export default function ConceptionHub() {
               </button>
               <button
                 onClick={handleStartPipeline}
-                className="px-6 py-2 rounded-full bg-primary text-on-primary font-sans text-label-md font-semibold shadow-lg shadow-primary/20 hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                disabled={isSubmitting}
+                className="px-6 py-2 rounded-full bg-primary text-on-primary font-sans text-label-md font-semibold shadow-lg shadow-primary/20 hover:scale-105 active:scale-95 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Start Pipeline
+                {isSubmitting ? "Starting..." : "Start Pipeline"}
               </button>
             </div>
           </div>
@@ -265,22 +286,9 @@ export default function ConceptionHub() {
           >
             <div className="h-10 bg-white/5 border-b border-white/5 flex items-center px-4 justify-between select-none">
               <div className="flex gap-4 h-full">
-                {(["Raw Input", "Preview Schema", "Metadata Tags"] as const).map((tab) => {
-                  const isActive = activeTab === tab;
-                  return (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      className={`font-sans text-[11px] h-full flex items-center px-1 transition-all cursor-pointer ${
-                        isActive
-                          ? "text-primary border-b border-primary"
-                          : "text-on-surface-variant hover:text-on-surface"
-                      }`}
-                    >
-                      {tab}
-                    </button>
-                  );
-                })}
+                <span className="font-sans text-[11px] h-full flex items-center px-1 text-primary border-b border-primary">
+                  Raw Input
+                </span>
               </div>
               <div className="flex gap-3">
                 <span className="material-symbols-outlined text-[16px] text-on-surface-variant hover:text-on-surface cursor-pointer" title="Upload Document">
@@ -296,83 +304,20 @@ export default function ConceptionHub() {
               </div>
             </div>
 
-            {activeTab === "Raw Input" ? (
-              <textarea
-                value={payloadText}
-                onChange={(e) => setPayloadText(e.target.value)}
-                className="flex-1 bg-transparent p-6 font-body text-body-md leading-relaxed text-on-surface outline-none border-none resize-none placeholder:text-white/10 scroll-smooth custom-scrollbar"
-                placeholder={`Paste your source context here...
+            <textarea
+              value={payloadText}
+              onChange={(e) => setPayloadText(e.target.value)}
+              className="flex-1 bg-transparent p-6 font-body text-body-md leading-relaxed text-on-surface outline-none border-none resize-none placeholder:text-white/10 scroll-smooth custom-scrollbar"
+              placeholder={`Paste your source context here...
 
 // Example: Technical Requirement Specification v4.2
 // Target: LLM Orchestration Layer
 // Scope: Multi-agent state synchronization via SSE...`}
-              />
-            ) : activeTab === "Preview Schema" ? (
-              <div className="flex-1 p-6 font-mono text-xs text-on-surface-variant overflow-y-auto custom-scrollbar">
-                <pre>{`{
-  "archetype": "${archetype.toLowerCase()}",
-  "loop_guard": ${loopGuard},
-  "modules": {
-    "semantic_enrichment": ${semanticEnrichment},
-    "conflict_detection": ${conflictDetection}
-  },
-  "payload_length": ${payloadText.length}
-}`}</pre>
-              </div>
-            ) : (
-              <div className="flex-1 p-6 flex flex-wrap gap-2 content-start overflow-y-auto custom-scrollbar">
-                <span className="px-3 py-1 rounded bg-white/5 border border-white/10 text-xs font-mono text-primary">#archetype:{archetype.toLowerCase()}</span>
-                <span className="px-3 py-1 rounded bg-white/5 border border-white/10 text-xs font-mono text-secondary">#loops:{loopGuard}</span>
-                {semanticEnrichment && <span className="px-3 py-1 rounded bg-white/5 border border-white/10 text-xs font-mono text-tertiary">#semantic-enrichment</span>}
-                {conflictDetection && <span className="px-3 py-1 rounded bg-white/5 border border-white/10 text-xs font-mono text-error">#conflict-detection</span>}
-              </div>
-            )}
+            />
           </div>
         </section>
       </div>
 
-      {/* Bottom Status Bar */}
-      <footer className="h-10 bg-surface-container-lowest border-t border-white/5 flex items-center justify-between px-container-margin z-40 shrink-0">
-        <div className="flex items-center gap-6">
-          <div className="flex items-center gap-2">
-            <span className="font-sans text-[10px] text-on-surface-variant uppercase tracking-widest">
-              Token Count:
-            </span>
-            <span className="font-sans text-label-md text-on-surface">
-              {tokenCount.toLocaleString()} / 128k
-            </span>
-            <div className="w-24 h-1 bg-white/5 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-primary transition-all duration-500"
-                style={{ width: `${Math.min(100, (tokenCount / 128000) * 100)}%` }}
-              ></div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="font-sans text-[10px] text-on-surface-variant uppercase tracking-widest">
-              Entropy Level:
-            </span>
-            <span className="font-sans text-label-md text-tertiary">0.245 (Low)</span>
-          </div>
-        </div>
-        <div className="flex items-center gap-6">
-          <div className="flex items-center gap-2">
-            <span className="font-sans text-[10px] text-on-surface-variant uppercase tracking-widest">
-              Region:
-            </span>
-            <span className="font-sans text-label-md text-on-surface flex items-center gap-1">
-              <span className="material-symbols-outlined text-[14px]">public</span>
-              <span>AWS-US-EAST-1</span>
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="font-sans text-[10px] text-on-surface-variant uppercase tracking-widest">
-              System Load:
-            </span>
-            <span className="font-sans text-label-md text-on-surface">14%</span>
-          </div>
-        </div>
-      </footer>
     </main>
   );
 }

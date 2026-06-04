@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.state import DocumentState
-from app.schemas import Scorecard, AuditCheck, TraceStep
+from app.schemas import Scorecard, AuditCheck, TraceStep, get_default_checks
 from app.config import settings
 
 # ── Groq client — used by critic_node (Malikkarjun's implementation) ─
@@ -121,12 +121,14 @@ async def writer_node(state: DocumentState) -> dict:
     payload = state.get("payloadText", "")
     feedback = state.get("feedback")
 
-    # Retrieve pgvector context — graceful fallback if DB not available
-    try:
-        from app.db import retrieve_context
-        context = await retrieve_context(query=payload, archetype=archetype)
-    except Exception:
-        context = "No style guide context available (DB not connected)."
+    # Retrieve pgvector context if semanticEnrichment is enabled
+    context = ""
+    if state.get("semanticEnrichment", True):
+        try:
+            from app.db import retrieve_context
+            context = await retrieve_context(query=payload, archetype=archetype)
+        except Exception:
+            context = "No style guide context available (DB not connected)."
 
     # Build prompt based on mode
     if feedback:
@@ -186,31 +188,42 @@ async def critic_node(state: DocumentState) -> dict:
     Returns a structured Scorecard.
     """
     document = state.get("documentContent", "")
+    archetype = state.get("archetype", "Technical")
+    conflict_detect = state.get("conflictDetection", False)
+
+    # Get dynamic check structures based on the document archetype
+    default_checks = get_default_checks(archetype, conflict_detect)
+    checks_eval_str = "\n    ".join([f"{idx+1}. {c['name']}" for idx, c in enumerate(default_checks)])
+    schema_checks_json = json.dumps([
+        {"id": c["id"], "name": c["name"], "status": "verified|attention|pending"}
+        for c in default_checks
+    ], indent=4)
+
+    conflict_instr = ""
+    if conflict_detect:
+        conflict_instr = (
+            f"\n    {len(default_checks)+3}. Contradiction & Conflict Detection:\n"
+            "    Verify that the document contains no internal contradictions, conflicts, or inconsistent "
+            "statements across sections. If any contradictions exist, mark status as 'attention' and "
+            "list them in the summary."
+        )
 
     prompt = f"""
-    You are a senior enterprise compliance reviewer.
+    You are a senior enterprise compliance reviewer specializing in {archetype} auditing.
 
     Review the following professional document.
 
     Evaluate:
-    1. Security Layer
-    2. Data Sovereignty
-    3. Token Handling
-    4. Rate Limiting
-    5. Structural Completeness
-    6. Compliance Quality
+    {checks_eval_str}
+    {len(default_checks)+1}. Structural Completeness
+    {len(default_checks)+2}. Compliance Quality{conflict_instr}
 
     Return STRICT JSON ONLY.
 
     Required JSON Schema:
 {{
   "score": integer,
-  "checks": [
-    {{"id": "sec", "name": "Security Layer",   "status": "verified|attention|pending"}},
-    {{"id": "sov", "name": "Data Sovereignty", "status": "verified|attention|pending"}},
-    {{"id": "tok", "name": "Token Handling",   "status": "verified|attention|pending"}},
-    {{"id": "rat", "name": "Rate Limiting",    "status": "verified|attention|pending"}}
-  ],
+  "checks": {schema_checks_json},
   "summary": "short critique summary"
 }}
 

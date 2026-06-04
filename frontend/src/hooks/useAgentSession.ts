@@ -64,6 +64,8 @@ export function useAgentSession(sessionId: string) {
   const simulationRef = useRef<number | null>(null);
   // Ref to hold the active EventSource so we can close/reopen it
   const eventSourceRef = useRef<EventSource | null>(null);
+  const hasReceivedDataRef = useRef(false);
+  const lastStatusRef = useRef<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -228,6 +230,9 @@ export function useAgentSession(sessionId: string) {
       eventSourceRef.current = null;
     }
 
+    hasReceivedDataRef.current = false;
+    lastStatusRef.current = null;
+
     const eventSource = new EventSource(
       `${API_BASE_URL}/api/documents/${sessionId}/stream`
     );
@@ -238,28 +243,34 @@ export function useAgentSession(sessionId: string) {
         const data = JSON.parse(event.data);
         setSession(data);
         setIsGenerating(data.status === "running");
+        hasReceivedDataRef.current = true;
+        lastStatusRef.current = data.status;
       } catch (err) {
         console.error("SSE parse error", err);
       }
     };
 
     eventSource.onerror = (err) => {
+      // If we already received data and the last status is paused/completed,
+      // the server closed the connection normally. Do not log an error or fallback to simulation.
+      if (hasReceivedDataRef.current && (lastStatusRef.current === "paused" || lastStatusRef.current === "completed")) {
+        eventSource.close();
+        eventSourceRef.current = null;
+        setIsGenerating(false);
+        return;
+      }
+
       console.error("SSE error", err);
       eventSource.close();
       eventSourceRef.current = null;
 
       // Only fall back to simulation if no real content was received
-      setSession((prev) => {
-        if (prev.documentContent && prev.documentContent.length > 50) {
-          // Real content exists — stream closed normally after paused/completed
-          setIsGenerating(false);
-          return prev;
-        }
-        // No real content — backend unavailable, run simulation
+      if (hasReceivedDataRef.current) {
+        setIsGenerating(false);
+      } else {
         setError("SSE channel disconnected. Falling back to local offline simulation.");
         runSimulation(0);
-        return prev;
-      });
+      }
     };
   }, [sessionId, runSimulation]);
 

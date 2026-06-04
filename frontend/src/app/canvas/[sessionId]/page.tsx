@@ -13,14 +13,85 @@ export default function AgenticCanvas() {
   const { session, isGenerating, error, requestRevision, approve } = useAgentSession(sessionId);
   
   const [feedback, setFeedback] = useState("");
+  const [copied, setCopied] = useState(false);
   const documentEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Typewriter effect state and refs
+  const [displayedContent, setDisplayedContent] = useState("");
+  const typingTimerRef = useRef<number | null>(null);
+  const isInitialLoadRef = useRef(true);
+  const lastLoopCountRef = useRef<number>(0);
+
+  // Typewriter effect runner
+  useEffect(() => {
+    const targetContent = session?.documentContent || "";
+    const currentLoopCount = session?.loopCount || 0;
+
+    // Reset typewriter if we advance to a new loop (revision cycle)
+    if (currentLoopCount !== lastLoopCountRef.current) {
+      lastLoopCountRef.current = currentLoopCount;
+      setDisplayedContent("");
+      return;
+    }
+
+    if (typingTimerRef.current) {
+      window.clearInterval(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+
+    if (!targetContent) {
+      setDisplayedContent("");
+      return;
+    }
+
+    // Show immediately if it's the initial page load with pre-existing content
+    if (isInitialLoadRef.current) {
+      const status = session?.status;
+      if (status === "paused" || status === "completed") {
+        setDisplayedContent(targetContent);
+        isInitialLoadRef.current = false;
+        return;
+      } else {
+        // It's actively generating (status is "running"), so type it out!
+        isInitialLoadRef.current = false;
+      }
+    }
+
+    if (targetContent.length <= displayedContent.length) {
+      setDisplayedContent(targetContent);
+      return;
+    }
+
+    // Increment character chunk per tick (faster for long documents)
+    const step = Math.max(8, Math.ceil((targetContent.length - displayedContent.length) / 70));
+    let currentLength = displayedContent.length;
+
+    typingTimerRef.current = window.setInterval(() => {
+      currentLength += step;
+      if (currentLength >= targetContent.length) {
+        setDisplayedContent(targetContent);
+        if (typingTimerRef.current) {
+          window.clearInterval(typingTimerRef.current);
+          typingTimerRef.current = null;
+        }
+      } else {
+        setDisplayedContent(targetContent.slice(0, currentLength));
+      }
+    }, 15);
+
+    return () => {
+      if (typingTimerRef.current) {
+        window.clearInterval(typingTimerRef.current);
+      }
+    };
+  }, [session?.documentContent, session?.loopCount]);
 
   // Auto-scroll document preview to bottom while generating content
   useEffect(() => {
     if (isGenerating && documentEndRef.current) {
       documentEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
-  }, [session.documentContent, isGenerating]);
+  }, [displayedContent, isGenerating]);
 
   // Handle revision submit
   const handleRequestRevision = () => {
@@ -33,10 +104,31 @@ export default function AgenticCanvas() {
     approve();
   };
 
+  const handleCopy = () => {
+    if (!session?.documentContent) return;
+    navigator.clipboard.writeText(session.documentContent);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownload = () => {
+    if (!session?.documentContent) return;
+    const blob = new Blob([session.documentContent], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const filename = `${session.archetype || "Document"}_${sessionId}.md`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   const displaySessionId = sessionId ? sessionId.toUpperCase() : "SESSION";
 
   return (
-    <main className="flex-1 flex flex-col relative overflow-hidden h-screen bg-surface text-on-surface">
+    <main className="flex-1 flex flex-col relative overflow-hidden h-screen bg-surface text-on-surface ml-64 pt-16">
       {/* Background Glows */}
       <div className="aurora-glow">
         <div className="aurora-blob bg-primary/10 top-0 left-1/4"></div>
@@ -50,13 +142,13 @@ export default function AgenticCanvas() {
             Agentic Canvas: {displaySessionId}
           </span>
           <span className="px-2 py-0.5 rounded bg-surface-container-high text-on-surface-variant text-[10px] font-sans uppercase tracking-widest border border-outline-variant">
-            {session.status === "running" ? "Agent Generation Active" : `${(session.status || "").toUpperCase()} SESSION`}
+            {session?.status === "running" ? "Agent Generation Active" : `${(session?.status || "").toUpperCase()} SESSION`}
           </span>
         </div>
         <div className="flex items-center gap-4">
-          {session.loopCount > 0 && (
+          {(session?.loopCount ?? 0) > 0 && (
             <div className="px-3 py-1 rounded bg-white/5 border border-white/10 text-xs font-mono text-tertiary">
-              Self-Correction Loop: {session.loopCount} / {session.maxLoops}
+              Self-Correction Loop: {session?.loopCount} / {session?.maxLoops}
             </div>
           )}
           <div className="flex -space-x-2">
@@ -95,7 +187,7 @@ export default function AgenticCanvas() {
             {/* Connecting Circuit Line */}
             <div className="circuit-line left-[7px] top-4 bottom-4"></div>
             
-            {session.trace.map((step, idx) => {
+            {session?.trace?.map((step, idx) => {
               const isCompleted = step.status === "completed";
               const isActive = step.status === "active";
               
@@ -150,16 +242,38 @@ export default function AgenticCanvas() {
               <div className="w-3 h-3 rounded-full bg-outline-variant"></div>
             </div>
             <div className="flex items-center gap-4 text-xs font-sans text-on-surface-variant">
-              <span>UTF-8</span>
-              <span>Markdown</span>
-              <span className="material-symbols-outlined text-sm cursor-pointer hover:text-primary transition-colors">
+              <span className="cursor-default">UTF-8</span>
+              <span className="cursor-default">Markdown</span>
+              {session?.documentContent && (
+                <>
+                  <button
+                    onClick={handleCopy}
+                    className="flex items-center gap-1 hover:text-primary transition-colors cursor-pointer"
+                    title="Copy Raw Markdown"
+                  >
+                    <span className="material-symbols-outlined text-sm">
+                      {copied ? "check" : "content_copy"}
+                    </span>
+                    <span>{copied ? "Copied" : "Copy"}</span>
+                  </button>
+                  <button
+                    onClick={handleDownload}
+                    className="flex items-center gap-1 hover:text-primary transition-colors cursor-pointer"
+                    title="Download Markdown File"
+                  >
+                    <span className="material-symbols-outlined text-sm">download</span>
+                    <span>Download</span>
+                  </button>
+                </>
+              )}
+              <span className="material-symbols-outlined text-sm cursor-pointer hover:text-primary transition-colors" title="Toggle Fullscreen">
                 fullscreen
               </span>
             </div>
           </div>
 
           <div className="flex-1 overflow-y-auto p-12 bg-surface/30 custom-scrollbar">
-            {session.documentContent ? (
+            {displayedContent ? (
               <article className="max-w-2xl mx-auto space-y-6 font-body text-on-surface/90 leading-relaxed">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
@@ -167,7 +281,7 @@ export default function AgenticCanvas() {
                     h1: ({ children }) => (
                       <div className="space-y-4 pb-2 border-b border-white/5">
                         <span className="text-primary font-sans text-label-sm tracking-widest uppercase">
-                          Draft (Loop {session.loopCount})
+                          Draft (Loop {session?.loopCount})
                         </span>
                         <h1 className="font-display text-4xl text-on-surface font-bold">
                           {children}
@@ -216,7 +330,7 @@ export default function AgenticCanvas() {
                     td: ({ children }) => <td className="px-4 py-3 text-sm text-on-surface-variant">{children}</td>,
                   }}
                 >
-                  {session.documentContent}
+                  {displayedContent}
                 </ReactMarkdown>
                 <div ref={documentEndRef} />
               </article>
@@ -261,15 +375,15 @@ export default function AgenticCanvas() {
                   stroke="currentColor"
                   strokeWidth="8"
                   strokeDasharray="364.4"
-                  strokeDashoffset={364.4 - (364.4 * session.scorecard.score) / 100}
+                  strokeDashoffset={364.4 - (364.4 * (session?.scorecard?.score || 0)) / 100}
                 ></circle>
               </svg>
               <span className="absolute text-3xl font-bold font-display">
-                {session.scorecard.score}
+                {session?.scorecard?.score || 0}
               </span>
             </div>
             <p className="text-xs text-on-surface-variant px-4 font-body">
-              {session.scorecard.summary}
+              {session?.scorecard?.summary}
             </p>
           </div>
 
@@ -279,7 +393,7 @@ export default function AgenticCanvas() {
               AUDIT CHECKLIST
             </h3>
             <div className="space-y-4 overflow-y-auto custom-scrollbar flex-1 pr-1">
-              {session.scorecard.checks.map((check) => (
+              {session?.scorecard?.checks?.map((check) => (
                 <div
                   key={check.id}
                   className={`flex items-start gap-3 p-3 rounded-xl border transition-colors ${
@@ -344,27 +458,27 @@ export default function AgenticCanvas() {
               <div className="flex items-center gap-2">
                 <div
                   className={`w-2 h-2 rounded-full ${
-                    session.status === "running"
+                    session?.status === "running"
                       ? "bg-primary animate-spin"
-                      : session.status === "paused"
+                      : session?.status === "paused"
                       ? "bg-outline animate-pulse"
-                      : session.status === "completed"
+                      : session?.status === "completed"
                       ? "bg-primary"
                       : "bg-error"
                   }`}
                 ></div>
                 <span
                   className={`text-xs font-bold font-display uppercase ${
-                    session.status === "running"
+                    session?.status === "running"
                       ? "text-primary"
-                      : session.status === "paused"
+                      : session?.status === "paused"
                       ? "text-outline"
-                      : session.status === "completed"
+                      : session?.status === "completed"
                       ? "text-primary"
                       : "text-error"
                   }`}
                 >
-                  {session.status === "running" ? "Running" : session.status}
+                  {session?.status === "running" ? "Running" : session?.status}
                 </span>
               </div>
             </div>
@@ -374,13 +488,13 @@ export default function AgenticCanvas() {
             <input
               type="text"
               value={feedback}
-              disabled={session.status === "running" || session.status === "completed"}
+              disabled={session?.status === "running" || session?.status === "completed"}
               onChange={(e) => setFeedback(e.target.value)}
               className="w-full bg-transparent border-none text-on-surface placeholder:text-on-surface-variant/40 focus:ring-0 font-body text-sm outline-none"
               placeholder={
-                session.status === "completed"
+                session?.status === "completed"
                   ? "Document pipeline successfully approved and completed."
-                  : session.status === "running"
+                  : session?.status === "running"
                   ? "Writing and self-correcting constraints internally..."
                   : "Provide feedback or ask for a specific change..."
               }
@@ -393,19 +507,19 @@ export default function AgenticCanvas() {
           <div className="flex items-center gap-2 pr-2 shrink-0">
             <button
               onClick={handleRequestRevision}
-              disabled={session.status === "running" || session.status === "completed" || !feedback.trim()}
+              disabled={session?.status === "running" || session?.status === "completed" || !feedback.trim()}
               className="px-5 py-2.5 rounded-full font-sans text-xs text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Request Revision
             </button>
             <button
               onClick={handleApprove}
-              disabled={session.status === "running" || session.status === "completed"}
+              disabled={session?.status === "running" || session?.status === "completed"}
               className="px-6 py-2.5 bg-primary text-on-primary rounded-full font-sans text-xs shadow-lg hover:brightness-110 active:scale-95 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span className="material-symbols-outlined text-sm">rocket_launch</span>
               <span>
-                {session.status === "completed" ? "Completed" : "Approve & Deploy"}
+                {session?.status === "completed" ? "Completed" : "Approve & Deploy"}
               </span>
             </button>
           </div>

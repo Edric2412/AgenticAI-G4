@@ -11,7 +11,14 @@ from pgvector.sqlalchemy import Vector
 # 1. Database Engine & Session Maker Setup
 # (This is a skeleton for Teammate A to configure further)
 try:
-    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=10,
+        max_overflow=20
+    )
     genai.configure(api_key=settings.GEMINI_API_KEY)
     AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 except Exception as e:
