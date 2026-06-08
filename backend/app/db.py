@@ -140,6 +140,7 @@ async def index_style_guide(content: str, archetype: str):
 async def retrieve_context(query: str, archetype: str) -> str:
     """
     Hybrid semantic + lexical retrieval using pgvector + PostgreSQL full-text search.
+    Optimized to restrict context window sizes and reduce latency.
     """
 
     if AsyncSessionLocal is None:
@@ -154,7 +155,11 @@ async def retrieve_context(query: str, archetype: str) -> str:
     archetype = archetype.strip().lower()
     query = query.strip()
 
-    embedding = await generate_embedding(query)
+    try:
+        embedding = await generate_embedding(query)
+    except Exception as e:
+        print(f"RAG: Failed to generate search embedding: {e}", file=sys.stderr)
+        return "No style guide context available (Embedding error)."
 
     async with AsyncSessionLocal() as session:
 
@@ -175,7 +180,7 @@ async def retrieve_context(query: str, archetype: str) -> str:
                         )
                     )
                 ASC
-                LIMIT 5
+                LIMIT 3
             """)
 
             result = await session.execute(
@@ -195,6 +200,95 @@ async def retrieve_context(query: str, archetype: str) -> str:
             )
 
     if not rows:
+        print(f"RAG audit: query='{query[:40]}...', archetype='{archetype}' -> 0 matches found.", file=sys.stderr)
         return "No style guide context found."
 
-    return "\n\n".join([row[0] for row in rows])
+    # Audit logging for validation
+    print(f"RAG audit: query='{query[:40]}...', archetype='{archetype}' -> {len(rows)} matches found:", file=sys.stderr)
+    retrieved_parts = []
+    for idx, row in enumerate(rows):
+        content_snippet = row[0][:100].replace('\n', ' ')
+        print(f"  Match {idx+1}: {content_snippet}...", file=sys.stderr)
+        # Clamps individual context sizes to 1500 chars to avoid API cost & latency blowups
+        retrieved_parts.append(row[0][:1500])
+
+    return "\n\n".join(retrieved_parts)
+
+async def seed_style_guides():
+    """
+    Seeds default style guide documents for each archetype if the table is empty.
+    """
+    if AsyncSessionLocal is None:
+        return
+
+    async with AsyncSessionLocal() as session:
+        try:
+            # Check if any embeddings exist
+            result = await session.execute(select(StyleGuideEmbedding).limit(1))
+            if result.scalars().first():
+                return  # already seeded
+
+            print("Seeding default style guides into PostgreSQL...", file=sys.stderr)
+            
+            seeds = [
+                {
+                    "archetype": "technical",
+                    "content": (
+                        "DocuFlow Technical Specification Style Guide:\n"
+                        "- Structure: Always include an Executive Summary, System Architecture, API Specifications, and Security section.\n"
+                        "- API Design: Specify JSON formats, endpoint HTTP verbs, and request/response payloads explicitly.\n"
+                        "- Latency: Target execution and endpoint latency must remain under 150ms.\n"
+                        "- Rate Limiting: Specify Token Bucket or Leaky Bucket algorithms for endpoint protection.\n"
+                        "- Infrastructure: Detail Docker, PostgreSQL, and cache components clearly."
+                    )
+                },
+                {
+                    "archetype": "legal",
+                    "content": (
+                        "DocuFlow Legal Contract and Agreement Rubric:\n"
+                        "- Sovereignty: Must enforce strict EU Data Sovereignty protocols and specify localized data hosting.\n"
+                        "- Compliance: Explicitly state compliance with GDPR regulations, data processing addendums, and privacy policies.\n"
+                        "- Liability: General liability caps must be included and capped at fees paid in the trailing 12 months.\n"
+                        "- Confidentiality: NDA agreements must restrict disclosures to defined business purposes and enforce 5-year survival terms.\n"
+                        "- Jurisdiction: Explicitly govern agreements under standard EU or Delaware law."
+                    )
+                },
+                {
+                    "archetype": "financial",
+                    "content": (
+                        "DocuFlow Fiscal and Financial Writing Guidelines:\n"
+                        "- Accuracy: Financial figures and transaction metrics must be precise, using up to 4 decimal places.\n"
+                        "- Statements: Earnings and audit documents must compile standard Balance Sheet, Income Statement, and Cash Flow metrics.\n"
+                        "- Disclosure: Always append a forward-looking statement risk warning regarding economic fluctuations.\n"
+                        "- Terminology: Use standard GAAP or IFRS terms (e.g. EBITDA, Revenue, Cost of Goods Sold).\n"
+                        "- Audits: Include transaction audit trails, compliance ledger logs, and revision loop summaries."
+                    )
+                },
+                {
+                    "archetype": "creative",
+                    "content": (
+                        "DocuFlow Creative and Marketing Copywriting Guidelines:\n"
+                        "- Tone: Bold, premium, engaging, and action-oriented brand voice. Avoid dry academic or technical jargon.\n"
+                        "- Structure: Apply the AIDA (Attention, Interest, Desire, Action) framework to structure pitches and landing pages.\n"
+                        "- Readability: Keep sentences short (under 25 words) and use bullet points or bold text for key benefits.\n"
+                        "- Content: Focus on customer pain points, value propositions, and clear CTAs (Call to Actions).\n"
+                        "- Aesthetics: Use rich, modern visual analogies and describe premium design tokens like Obsidian Glass and Aurora Glow."
+                    )
+                }
+            ]
+
+            for s in seeds:
+                # Generate embedding
+                embedding = await generate_embedding(s["content"])
+                entry = StyleGuideEmbedding(
+                    archetype=s["archetype"],
+                    content=s["content"],
+                    embedding=embedding
+                )
+                session.add(entry)
+                
+            await session.commit()
+            print("Successfully seeded all 4 document archetypes.", file=sys.stderr)
+        except Exception as e:
+            await session.rollback()
+            print(f"Failed to seed style guides: {e}", file=sys.stderr)
