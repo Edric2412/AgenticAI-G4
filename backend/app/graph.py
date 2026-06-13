@@ -1,6 +1,7 @@
 import asyncio
 import json
 import httpx
+import re
 from openai import AsyncOpenAI
 from typing import Literal
 
@@ -10,6 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.state import DocumentState
 from app.schemas import Scorecard, AuditCheck, TraceStep, get_default_checks
 from app.config import settings
+from langsmith import traceable
 
 # ── Groq client — used by critic_node (Malikkarjun's implementation) ─
 groq_client = AsyncOpenAI(
@@ -17,12 +19,24 @@ groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
+@traceable(name="Llama Critic LLM Call", run_type="llm")
+async def call_groq(prompt: str) -> str:
+    """Calls Groq Llama completions asynchronously."""
+    response = await groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
+
 # ── Gemini REST endpoint — used by writer_node ────────────────────────
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models"
     "/gemini-3.1-flash-lite:generateContent"
 )
 
+@traceable(name="Gemini Writer LLM Call", run_type="llm")
 async def call_gemini(prompt: str) -> str:
     """
     Calls Gemini REST API asynchronously via httpx.
@@ -86,7 +100,9 @@ def build_revision_prompt(
 ) -> str:
     return f"""You are a professional document revision AI specialising in {archetype} documents.
 
-Revise the document below based on the feedback. Only change what the feedback asks for.
+Revise the document below based on the feedback. 
+Ensure you perform a targeted revision: only modify the sections that are flagged or require changes, and preserve the rest of the document's content, headings, and structure exactly. Do not rewrite the entire document from scratch unless requested.
+
 Output ONLY the complete revised Markdown document. No preamble or commentary.
 
 COMPLIANCE & STYLE CONTEXT:
@@ -95,7 +111,7 @@ COMPLIANCE & STYLE CONTEXT:
 CURRENT DOCUMENT DRAFT:
 {existing_document}
 
-HUMAN REVIEWER FEEDBACK:
+REVIEWER FEEDBACK (CRITIC OR HUMAN):
 {feedback}
 
 Output the full revised document below:
@@ -120,6 +136,25 @@ async def writer_node(state: DocumentState) -> dict:
     archetype = state.get("archetype", "Technical")
     payload = state.get("payloadText", "")
     feedback = state.get("feedback")
+
+    # Formulate feedback from Critic's scorecard if in self-correction loop without manual feedback
+    if not feedback and loop_count > 0 and state.get("scorecard"):
+        scorecard = state.get("scorecard")
+        summary = scorecard.summary if hasattr(scorecard, "summary") else scorecard.get("summary", "")
+        checks = scorecard.checks if hasattr(scorecard, "checks") else scorecard.get("checks", [])
+        
+        failing_checks = []
+        for c in checks:
+            name = c.name if hasattr(c, "name") else c.get("name", "")
+            status = c.status if hasattr(c, "status") else c.get("status", "")
+            if status in ("attention", "pending"):
+                failing_checks.append(name)
+                
+        critic_score = scorecard.score if hasattr(scorecard, "score") else scorecard.get("score", 0)
+        feedback = f"Critic Score: {critic_score}/100\n"
+        feedback += f"Critique Summary: {summary}\n"
+        if failing_checks:
+            feedback += "Failing Compliance Checks:\n- " + "\n- ".join(failing_checks)
 
     # Retrieve pgvector context if semanticEnrichment is enabled
     context = ""
@@ -180,6 +215,41 @@ async def writer_node(state: DocumentState) -> dict:
     }
 
 
+# ── JSON REPAIR UTILITY ───────────────────────────────────────────────
+
+def repair_json(raw_text: str) -> dict:
+    """
+    Cleans and attempts to parse malformed JSON strings.
+    """
+    cleaned = raw_text.strip()
+    # Remove markdown code block wrappers
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\n", "", cleaned)
+        cleaned = re.sub(r"\n```$", "", cleaned)
+        cleaned = cleaned.strip()
+
+    # Find first '{' and last '}'
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx != -1 and end_idx != -1:
+        cleaned = cleaned[start_idx:end_idx+1]
+        
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+        
+    # Attempt common regex repairs
+    try:
+        # Fix trailing commas before closing braces/brackets
+        repaired = re.sub(r",\s*([\]}])", r"\1", cleaned)
+        # Fix unescaped newlines in string values
+        repaired = re.sub(r'(:\s*"[^"]*)\n([^"]*")', r'\1\\n\2', repaired)
+        return json.loads(repaired)
+    except Exception:
+        raise ValueError("Could not repair malformed JSON content.")
+
+
 # ── CRITIC NODE (Malikkarjun's Groq implementation — merged) ─────────
 
 async def critic_node(state: DocumentState) -> dict:
@@ -190,6 +260,16 @@ async def critic_node(state: DocumentState) -> dict:
     document = state.get("documentContent", "")
     archetype = state.get("archetype", "Technical")
     conflict_detect = state.get("conflictDetection", False)
+    payload = state.get("payloadText", "")
+
+    # Retrieve style guide context for strict evaluation
+    context = ""
+    if state.get("semanticEnrichment", True):
+        try:
+            from app.db import retrieve_context
+            context = await retrieve_context(query=payload, archetype=archetype)
+        except Exception:
+            context = "No style guide context available."
 
     # Get dynamic check structures based on the document archetype
     default_checks = get_default_checks(archetype, conflict_detect)
@@ -211,42 +291,75 @@ async def critic_node(state: DocumentState) -> dict:
     prompt = f"""
     You are a senior enterprise compliance reviewer specializing in {archetype} auditing.
 
-    Review the following professional document.
+    Review the following professional document against the compliance guidelines and style guide context.
 
-    Evaluate:
+    COMPLIANCE & STYLE GUIDE CONTEXT:
+    {context}
+    Evaluate it objectively and constructively.
+
+    Evaluate against these checklist items:
     {checks_eval_str}
     {len(default_checks)+1}. Structural Completeness
     {len(default_checks)+2}. Compliance Quality{conflict_instr}
 
+    SCORING GUIDELINES:
+    - If ANY checklist item is missing, incomplete, or requires attention (status is 'attention' or 'pending'), the score MUST be strictly less than 95 (e.g. 80-90) to trigger human review/revision.
+    - If ALL checklist items are fully addressed and verified, you may score it generously (>= 95).
+    - If the document meets the basic compliance criteria and addresses previous revision requests, score it generously (>= 95).
+    - Avoid shifting expectations or rejecting revisions for minor stylistic preferences.
+
     Return STRICT JSON ONLY.
 
     Required JSON Schema:
-{{
-  "score": integer,
-  "checks": {schema_checks_json},
-  "summary": "short critique summary"
-}}
+    {{
+      "score": integer,
+      "checks": {schema_checks_json},
+      "summary": "short critique summary"
+    }}
 
     Document:
     {document}
     """
 
     try:
-        response = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            response_format={"type": "json_object"},
+        content = await call_groq(prompt)
+        parsed = repair_json(content)
+        
+        # Ensure 'checks' key exists and is valid
+        if "checks" not in parsed or not isinstance(parsed["checks"], list):
+            parsed["checks"] = [
+                {"id": c["id"], "name": c["name"], "status": "attention"}
+                for c in default_checks
+            ]
+        # Clean/map list elements into AuditCheck instances if they are dicts
+        mapped_checks = []
+        for c in parsed["checks"]:
+            if isinstance(c, dict):
+                mapped_checks.append(AuditCheck(
+                    id=c.get("id", "chk"),
+                    name=c.get("name", "Audit Check"),
+                    status=c.get("status", "attention")
+                ))
+            else:
+                mapped_checks.append(c)
+                
+        scorecard = Scorecard(
+            score=parsed.get("score", 70),
+            checks=mapped_checks,
+            summary=parsed.get("summary", "Validation complete.")
         )
-        content = response.choices[0].message.content
-        cleaned = content.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(cleaned)
-        scorecard = Scorecard(**parsed)
 
     except Exception as e:
-        raise RuntimeError(f"Groq critique generation failed: {str(e)}")
+        import sys
+        print(f"Groq critique parsing failed, initiating fallback: {e}", file=sys.stderr)
+        scorecard = Scorecard(
+            score=70,  # below 95 to trigger self-correction
+            checks=[
+                AuditCheck(id=c["id"], name=c["name"], status="attention")
+                for c in default_checks
+            ],
+            summary=f"Critic response parsing failed: {str(e)}. Initiating self-correction loop."
+        )
 
     trace = list(state.get("trace", []))
     trace[3] = TraceStep(
@@ -294,7 +407,7 @@ def route_evaluation(
     loop_count = state.get("loopCount", 0)
     max_loops = state.get("maxLoops", 3)
 
-    if score >= 95:
+    if loop_count == 0 and score >= 95:
         return "deployment_node"
     if loop_count >= max_loops:
         return "human_arbitration_node"
@@ -362,12 +475,17 @@ workflow.add_conditional_edges(
 
 workflow.add_edge("deployment_node", END)
 
-# ── MEMORY CHECKPOINTER ───────────────────────────────────────────────
-# MemorySaver stores state snapshots in RAM.
-# For production: swap with AsyncPostgresSaver once DB is ready.
-memory = MemorySaver()
+# ── GRAPH COMPILATION FUNCTION ────────────────────────────────────────
 
-app_graph = workflow.compile(
-    checkpointer=memory,
-    interrupt_before=["human_arbitration_node"],  # ← HITL pause point
-)
+def compile_graph(checkpointer=None):
+    """
+    Compiles the LangGraph workflow. Can be compiled statically 
+    for testing or dynamically with a Postgres checkpointer.
+    """
+    return workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_arbitration_node"],  # ← HITL pause point
+    )
+
+# Default static compile (RAM MemorySaver fallback for unit tests/scripts)
+app_graph = compile_graph(checkpointer=MemorySaver())

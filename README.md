@@ -34,7 +34,7 @@ graph TD
     C["Writer Node (gemini-3.1-flash-lite)"]:::agent
     D["Critic Node (Llama 3.3 70B via Groq)"]:::agent
     E{Router Decision Edge}:::check
-    F["Human-in-the-Loop Interrupt Gate"]:::hitl
+    F["Human-in-the-Loop Interrupt Gate<br>(Awaiting Review)"]:::hitl
     G["Deployment Node"]:::endNode
 
     %% Flow Paths
@@ -43,15 +43,15 @@ graph TD
     C --> D
     D --> E
     
-    %% Loops
-    E -- "Score < 95 & Cycles < 3 (Loop back)" --> H[Increment Loop Count]
-    H --> C
+    %% Routing Decisions
+    E -- "Initial run & Score >= 95" --> G
+    E -- "Initial run & Score < 95" --> F
+    E -- "Revision run (Cycles > 0)" --> F
+    E -- "Circuit Breaker (Cycles >= 3)" --> F
     
-    E -- "Score >= 95" --> G
-    E -- "Circuit Breaker: Cycles >= 3" --> F
-    
+    %% HITL Actions
     F -- "User Feedback (Resume Loop)" --> C
-    F -- "User Approval (Final Deploy)" --> G
+    F -- "User Approval (Approve & Deploy)" --> G
 ```
 
 ---
@@ -81,6 +81,10 @@ graph TD
 > [!TIP]
 > **Semantic Enrichment & Conflict Detection Toggles**  
 > Conception Hub toggles dynamically control downstream model behaviors. *Semantic Enrichment* pulls style context dynamically via `pgvector` to enrich drafts, while *Conflict Detection* appends a dedicated internal contradiction evaluation check (ID: `con`) to the Critic's prompt and checklist.
+
+> [!IMPORTANT]
+> **Human-in-the-Loop Revision Gate**  
+> Direct deployment (score &ge; 95 bypass) is restricted strictly to the first iteration. Any subsequent iteration (`cycles > 0`) bypasses automatic deployment and routes directly to the human interrupt gate, ensuring that no AI revisions are deployed without manual review.
 
 ---
 
@@ -291,7 +295,7 @@ http://127.0.0.1:8000/docs
 
 ## 🧪 End-to-End Archetype Testing
 
-DocuFlow AI includes a robust Playwright E2E integration test suite that verifies the entire document generation, human revision loop, approval, and dashboard reporting flow. The test script has been parameterized to support testing any of the document archetypes.
+DocuFlow AI includes a robust Playwright E2E integration test suite that verifies the entire document generation, human revision loop, approval, and dashboard reporting flow. The test script has been parameterized to support testing any of the document archetypes (`Technical`, `Legal`, `Financial`, `Creative`).
 
 ### Running Archetype E2E Tests
 
@@ -299,7 +303,7 @@ Ensure both the Next.js frontend (port 3000) and the FastAPI backend (port 8000)
 
 ```bash
 # Run tests using the backend virtual environment python
-./backend/venv/bin/python e2e_test.py --archetype [Technical | Legal | Financial | Creative]
+./backend/.venv/bin/python e2e_test.py --archetype [Technical | Legal | Financial | Creative]
 ```
 
 * Archetype-specific screenshots (e.g. `1_conception_legal.png`, `4_canvas_paused_legal.png`, etc.) will be archived in the workspace scratch directory: `/home/edricjsam/.gemini/antigravity-ide/scratch/`.
@@ -318,3 +322,26 @@ The database connector incorporates production-grade resiliency controls to prev
 
 3. **Transaction Rollback Safeguards**:
    The persistence layer explicitly catches `BaseException` (which captures `asyncio.CancelledError`) to execute a clean transaction rollback on cancellation before bubbling up, preventing session leaks.
+
+4. **Concurrency-Safe Checkpointer Pooling (`AsyncConnectionPool`)**:
+   Using a raw single connection for `AsyncPostgresSaver` crashes with `psycopg.OperationalError` if concurrent HTTP requests (such as the SSE status stream) occur during graph execution. DocuFlow AI integrates `AsyncPostgresSaver` with `psycopg_pool.AsyncConnectionPool` to dynamically manage connection checkouts, preventing connection sharing concurrency exceptions.
+
+---
+
+## 📊 Observability & Latency Tuning (LangSmith)
+
+DocuFlow AI integrates native LangSmith tracing to monitor execution flow, latency, and token consumption of the Writer-Critic loop.
+
+### 1. Environment Variable Setup
+Environment variables must be configured on application startup. This is handled dynamically within the FastAPI `lifespan` event handler to ensure configuration takes place before any LangChain/LangGraph modules are imported:
+
+```env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your_langsmith_api_key
+LANGCHAIN_PROJECT=docuflow-ai
+```
+
+### 2. Function-Level Tracing
+Core external API endpoints are wrapped using the `@traceable` decorator from `langsmith` to capture latency and input/output payloads:
+- **Writer Node Calls**: The `call_gemini` helper function is decorated to trace prompt parameters and the generated markdown drafts from `gemini-3.1-flash-lite`.
+- **Critic Node Calls**: The `call_groq` helper function is decorated to capture JSON-formatted evaluations and scorecards from `llama-3.3-70b-versatile`.

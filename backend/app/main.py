@@ -1,3 +1,14 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# Set LangSmith environment variables early before other imports
+if os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true":
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    if os.getenv("LANGCHAIN_API_KEY"):
+        os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
+    os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "docuflow-ai")
+
 import asyncio
 import json
 import uuid
@@ -19,7 +30,74 @@ from app.schemas import (
 from app.graph import app_graph
 from app.state import DocumentState
 
-app = FastAPI(title="DocuFlow AI Backend Gateway", version="1.0.0")
+import os
+from contextlib import asynccontextmanager
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from app.config import settings
+
+# Input Sanitization Guardrail
+def validate_input_guardrail(text: str):
+    if not text:
+        return
+    text_lower = text.lower()
+    injections = [
+        "ignore previous instructions",
+        "ignore all previous instructions",
+        "system override",
+        "developer mode",
+        "jailbreak",
+        "ignore checks",
+        "ignore compliance",
+        "bypass safety",
+        "forget your instructions",
+        "override system prompt"
+    ]
+    for injection in injections:
+        if injection in text_lower:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt validation failed: Security violation (Adversarial input pattern '{injection}' detected)."
+            )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Set LangSmith environment variables on startup
+    if settings.LANGCHAIN_TRACING_V2.lower() == "true" and settings.LANGCHAIN_API_KEY:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
+        os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT or "docuflow-ai"
+        print(f"LangSmith Tracing enabled: project={os.environ['LANGCHAIN_PROJECT']}")
+
+    # Initialize PostgreSQL Checkpointer with a connection pool to support concurrent requests safely
+    from psycopg_pool import AsyncConnectionPool
+    conn_string = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    async with AsyncConnectionPool(conn_string, max_size=10, min_size=2) as pool:
+        checkpointer = AsyncPostgresSaver(conn=pool)
+        # Create necessary checkpoints tables
+        await checkpointer.setup()
+        
+        # Compile graph with Postgres checkpointer
+        from app.graph import compile_graph
+        global app_graph
+        app_graph = compile_graph(checkpointer=checkpointer)
+        app.state.graph = app_graph
+        print("LangGraph PostgreSQL checkpointer setup complete.")
+
+        # Initialize base tables
+        from app.db import Base, engine, seed_style_guides
+        if engine:
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                print("Database tables initialized successfully.")
+                # Seed style guides
+                await seed_style_guides()
+            except Exception as e:
+                print(f"Database table initialization failed: {e}")
+
+        yield
+
+app = FastAPI(title="DocuFlow AI Backend Gateway", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,17 +113,6 @@ app.add_middleware(
 )
 
 session_configs = {}
-
-@app.on_event("startup")
-async def startup_event():
-    from app.db import Base, engine
-    if engine:
-        try:
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            print("Database tables initialized successfully.")
-        except Exception as e:
-            print(f"Database table initialization failed: {e}")
 
 async def persist_session_state(session_id: str):
     from app.db import AsyncSessionLocal, SessionState
@@ -165,7 +232,7 @@ async def list_documents_and_metrics():
                     # Lazy-load back into memory checkpointer if server restarted
                     config = {"configurable": {"thread_id": db_state.session_id}}
                     checkpointer = app_graph.checkpointer
-                    if hasattr(checkpointer, "storage") and db_state.session_id not in checkpointer.storage:
+                    if hasattr(checkpointer, "storage") and checkpointer.storage is not None and db_state.session_id not in checkpointer.storage:
                         scorecard_obj = Scorecard(**db_state.scorecard) if db_state.scorecard else None
                         trace_obj_list = [TraceStep(**t) for t in db_state.trace] if db_state.trace else []
                         
@@ -196,7 +263,7 @@ async def list_documents_and_metrics():
     # Fallback to checkpointer storage if DB is not used or empty
     if not registry:
         checkpointer = app_graph.checkpointer
-        thread_ids = list(checkpointer.storage.keys()) if hasattr(checkpointer, "storage") else []
+        thread_ids = list(checkpointer.storage.keys()) if hasattr(checkpointer, "storage") and checkpointer.storage is not None else []
         for thread_id in thread_ids:
             config = {"configurable": {"thread_id": thread_id}}
             state_info = await app_graph.aget_state(config)
@@ -269,6 +336,7 @@ async def list_documents_and_metrics():
 
 @app.post("/api/documents", status_code=201)
 async def create_document(request: CreateDocumentRequest, background_tasks: BackgroundTasks):
+    validate_input_guardrail(request.payloadText)
     session_id = f"dfl_{uuid.uuid4().hex[:9]}"
 
     session_configs[session_id] = {
@@ -381,6 +449,7 @@ async def get_document_state(sessionId: str, request: Request):
 
 @app.post("/api/documents/{sessionId}/feedback")
 async def submit_revision_feedback(sessionId: str, request: FeedbackRequest, background_tasks: BackgroundTasks):
+    validate_input_guardrail(request.feedback)
     config = {"configurable": {"thread_id": sessionId}}
     state_info = await app_graph.aget_state(config)
 
